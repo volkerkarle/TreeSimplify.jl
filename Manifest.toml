@@ -1,0 +1,10 @@
+# This file is machine-generated - editing it directly is not advised
+
+julia_version = "1.12.6"
+manifest_format = "2.0"
+project_hash = "9589ebbd2b66f3a00f493ff03dc732b78df59800"
+
+[[deps.TreeSimplify]]
+path = "."
+uuid = "21d81773-9eda-4ff2-aa0c-5a792df8d0cc"
+version = "0.1.0"
