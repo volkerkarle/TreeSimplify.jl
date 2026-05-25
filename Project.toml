@@ -3,5 +3,24 @@ uuid = "21d81773-9eda-4ff2-aa0c-5a792df8d0cc"
 version = "0.1.0"
 authors = ["volkerkarle"]
 
+[deps]
+Latexify = "23fbe1c1-3f47-55db-b15f-69d7ec21a316"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+SymbolicUtils = "d1185830-fcd6-423d-90d6-eec64667417b"
+Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
+
 [compat]
+Latexify = "0.16.10"
+SymbolicUtils = "3"
+Symbolics = "6"
 julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
