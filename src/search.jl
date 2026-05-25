@@ -328,6 +328,56 @@ function simplify(expr; config::RunConfig = RunConfig())
         end
     end
 
+    post_result = apply_post_simplify(
+        best_expr;
+        max_nodes = config.post_simplify_max_nodes,
+        timeout_secs = config.post_simplify_timeout_secs,
+    )
+    push_event!(trace, :post_simplify,
+        payload = (successful = post_result.successful, attempted = post_result.attempted,
+                   elapsed = post_result.elapsed_secs, timed_out = post_result.timed_out))
+    post_score = expression_score(post_result.expr, config.scoring)
+    post_improved = post_score < best_score
+    if post_improved
+        best_expr = post_result.expr
+        best_score = post_score
+        reason = :post_simplify
+    end
+
+    if config.simplify_max_passes > 1 && structural_hash(best_expr) != structural_hash(symbolic_expr)
+        remaining_passes = config.simplify_max_passes - 1
+        next_max_nodes = round(Int, config.post_simplify_max_nodes * config.simplify_pass_nodes_growth)
+        next_config = RunConfig(
+            seed = config.seed,
+            budget = config.budget,
+            validation = config.validation,
+            scoring = config.scoring,
+            novelty_penalty = config.novelty_penalty,
+            rule_family_throttle = config.rule_family_throttle,
+            targeted_hotspot_sites = config.targeted_hotspot_sites,
+            targeted_hotspot_max_nodes = config.targeted_hotspot_max_nodes,
+            acceptance_improvement_min = config.acceptance_improvement_min,
+            enable_hard_case_escalation = config.enable_hard_case_escalation,
+            deterministic = config.deterministic,
+            targeted_disable_streak = config.targeted_disable_streak,
+            post_simplify_max_nodes = next_max_nodes,
+            post_simplify_timeout_secs = config.post_simplify_timeout_secs,
+            simplify_max_passes = remaining_passes,
+            simplify_pass_nodes_growth = config.simplify_pass_nodes_growth,
+        )
+        next_result = simplify(best_expr; config = next_config)
+        if next_result.score_after < best_score
+            best_expr = next_result.best_expr
+            best_score = next_result.score_after
+            reason = next_result.stats.terminated_reason
+            expansions += next_result.stats.expansions
+            # Merge trace events from recursive pass
+            for ev in next_result.trace.events
+                push_event!(trace, ev.event, payload = ev.payload)
+            end
+        end
+    end
+
     after_score = expression_score(best_expr, config.scoring)
     report = validate_equivalence(symbolic_expr, best_expr, config)
     improvement = before_score - after_score

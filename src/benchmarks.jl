@@ -69,6 +69,7 @@ function _parse_symbolic_expression(raw::AbstractString; python_syntax::Bool)
     expr_str = strip(raw)
     python_syntax && (expr_str = replace(expr_str, "**" => "^"))
     python_syntax && (expr_str = replace(expr_str, r"\bw\b" => "ω"))
+    expr_str = replace(expr_str, r"(\d+)//(\d+)" => s"BigInt(\1)//BigInt(\2)")
     parsed = Meta.parse(expr_str)
     g1, g2, d1, d3, ω = let
         @variables g1 g2 d1 d3 ω

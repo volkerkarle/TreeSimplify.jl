@@ -38,4 +38,8 @@ Base.@kwdef struct RunConfig
     enable_hard_case_escalation::Bool = false
     deterministic::Bool = true
     targeted_disable_streak::Int = 3
+    post_simplify_max_nodes::Int = 800
+    post_simplify_timeout_secs::Float64 = 60.0
+    simplify_max_passes::Int = 3
+    simplify_pass_nodes_growth::Float64 = 2.5
 end

@@ -202,6 +202,60 @@ function apply_profile_rewrites(expr; profile::AbstractRewriteProfile = SafeRewr
 end
 
 """
+    apply_post_simplify(expr; max_nodes=800, max_passes=4, timeout_secs=60.0)
+
+After beam search, apply `simplify_fractions` to division-containing
+subtrees bounded by max_nodes. Uses BigInt-coefficient-safe arithmetic.
+Returns the expression (possibly unchanged) and a summary NamedTuple.
+"""
+function apply_post_simplify(expr; max_nodes::Int = 800, max_passes::Int = 4, timeout_secs::Float64 = 60.0)
+    current = expression_term(expr)
+    start_time = time()
+    successful = 0
+    attempted = Ref(0)
+    for pass in 1:max_passes
+        this_pass = Ref(0)
+        rewritten = _rewrite_postwalk(current, node -> begin
+            if (time() - start_time) >= timeout_secs
+                return nothing
+            end
+            attempted[] += 1
+            if _term_size(node; limit = max_nodes) > max_nodes
+                return nothing
+            end
+            _contains_division(node) || return nothing
+            candidate = try
+                SymbolicUtils.simplify_fractions(node)
+            catch
+                nothing
+            end
+            if candidate === nothing || structural_hash(candidate) == structural_hash(node)
+                return nothing
+            end
+            this_pass[] += 1
+            return candidate
+        end)
+        successful += this_pass[]
+        before_hash = structural_hash(current)
+        current = rewritten
+        if (time() - start_time) >= timeout_secs
+            break
+        end
+        if structural_hash(current) == before_hash
+            break
+        end
+    end
+    elapsed = time() - start_time
+    return (
+        expr = current,
+        successful = successful,
+        attempted = attempted[],
+        elapsed_secs = elapsed,
+        timed_out = elapsed >= timeout_secs,
+    )
+end
+
+"""
     rewrite_profiles()
 
 Return rewrite profile identifiers used by the orchestration layer.
