@@ -118,8 +118,8 @@ expression corpus.
 function benchmark_cases()
     root = normpath(joinpath(@__DIR__, ".."))
     return (
-        BenchmarkCase("sw_nonrwa_order4_coeffs", joinpath(root, "expressions/sw_nonrwa_order4_coeffs.txt")),
-        BenchmarkCase("extracted_sw_nonrwa_coefficients_output", joinpath(root, "expressions/extracted_sw_nonrwa_coefficients_output.txt")),
+        BenchmarkCase("sw_nonrwa_order4_coeffs", joinpath(root, "expressions/non_RWA_example/sw_nonrwa_order4_coeffs.txt")),
+        BenchmarkCase("extracted_sw_nonrwa_coefficients_output", joinpath(root, "expressions/non_RWA_example/extracted_sw_nonrwa_coefficients_output.txt")),
     )
 end
 
@@ -255,8 +255,8 @@ output expressions against the expected compact forms.
 Returns an `EndToEndSummary` with per-section records.
 """
 function run_end_to_end_validation(
-    sw_path::String = joinpath(normpath(joinpath(@__DIR__, "..")), "expressions/sw_nonrwa_order4_coeffs.txt"),
-    expected_path::String = joinpath(normpath(joinpath(@__DIR__, "..")), "expressions/extracted_sw_nonrwa_coefficients_output.txt");
+    sw_path::String = joinpath(normpath(joinpath(@__DIR__, "..")), "expressions/non_RWA_example/sw_nonrwa_order4_coeffs.txt"),
+    expected_path::String = joinpath(normpath(joinpath(@__DIR__, "..")), "expressions/non_RWA_example/extracted_sw_nonrwa_coefficients_output.txt");
     config::RunConfig = RunConfig(),
 )
     sw = _load_sw_sections(sw_path)
