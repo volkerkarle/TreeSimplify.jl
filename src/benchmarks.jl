@@ -2,8 +2,8 @@
 # end-to-end validation.
 #
 # Supports two expression-file formats:
-#   - SW sections:  `--- label ---`  (one expression per section)
-#   - Expected:     `[label]`        (INI-style, one expression per section)
+#   - Input sections:  `--- label ---`  (one expression per section)
+#   - Expected:        `[label]`        (INI-style, one expression per section)
 #
 # The main entry points are:
 #   - run_benchmarks()            – runs all registered benchmark cases
@@ -112,8 +112,8 @@ end
 """
     benchmark_cases()
 
-Return the two registered benchmark case descriptors for the SW
-non-RWA corpus.
+Return the two registered benchmark case descriptors for the
+expression corpus.
 """
 function benchmark_cases()
     root = normpath(joinpath(@__DIR__, ".."))
@@ -129,7 +129,7 @@ end
     _normalize_expected_label(label)
 
 Normalise section labels from the expected-output file.  The labels may
-use Unicode superscripts and daggers that need mapping to match the SW
+use Unicode superscripts and daggers that need mapping to match the
 input-file convention.
 """
 function _normalize_expected_label(label::AbstractString)
@@ -157,7 +157,7 @@ Parse an expression string into a symbolic expression.
 
 When `python_syntax` is true (expected-output format):
   - `**` exponentiation is replaced with `^`
-  - `w` is replaced with `ω` (the detuning symbol used in this corpus)
+  - `w` is replaced with `ω` (variable name used in this corpus)
 
 When false (input format): expressions use Julia syntax directly.
 
@@ -249,7 +249,7 @@ end
 """
     run_end_to_end_validation(sw_path, expected_path; config=RunConfig())
 
-Run simplify on each section of the SW corpus and compare input and
+Run simplify on each section of the benchmark corpus and compare input and
 output expressions against the expected compact forms.
 
 Returns an `EndToEndSummary` with per-section records.
@@ -292,7 +292,7 @@ end
     _detect_file_format(path)
 
 Read the first non-empty, non-comment line and check whether the file
-uses SW sections (`--- label ---`) or expected sections (`[label]`).
+uses input sections (`--- label ---`) or expected sections (`[label]`).
 
 Returns `:sw_sections`, `:expected_sections`, or `:plain`.
 """
