@@ -1,8 +1,44 @@
+# benchmarks.jl — Benchmark infrastructure, corpus loading, and
+# end-to-end validation.
+#
+# Supports two expression-file formats:
+#   - SW sections:  `--- label ---`  (one expression per section)
+#   - Expected:     `[label]`        (INI-style, one expression per section)
+#
+# The main entry points are:
+#   - run_benchmarks()            – runs all registered benchmark cases
+#   - run_end_to_end_validation() – validates simplify output against
+#                                   expected compact forms
+#   - run_section_benchmark()     – single-expression reporting
+
+"""
+    BenchmarkCase
+
+A named expression file to benchmark.
+
+Fields:
+- `name`           – short identifier
+- `expression_path`– path to the expression file
+"""
 Base.@kwdef struct BenchmarkCase
     name::String
     expression_path::String
 end
 
+"""
+    BenchmarkResult
+
+Result of running simplify on a single BenchmarkCase.
+
+Fields:
+- `case`              – the benchmark case
+- `parsed`            – whether the expression file was successfully parsed
+- `accepted`          – whether simplify accepted the result
+- `score_before`      – input expression cost
+- `score_after`       – output expression cost
+- `output_hash`       – SHA-1 of the best expression
+- `terminated_reason` – why simplify terminated
+"""
 Base.@kwdef struct BenchmarkResult
     case::BenchmarkCase
     parsed::Bool
@@ -13,6 +49,17 @@ Base.@kwdef struct BenchmarkResult
     terminated_reason::Symbol
 end
 
+"""
+    BenchmarkSummary
+
+Aggregate results from running all benchmark cases.
+
+Fields:
+- `results`             – individual per-case results
+- `accepted_count`      – number of accepted results
+- `total_count`         – total number of cases
+- `median_improvement`  – median score improvement across all cases
+"""
 Base.@kwdef struct BenchmarkSummary
     results::Vector{BenchmarkResult}
     accepted_count::Int
@@ -20,6 +67,21 @@ Base.@kwdef struct BenchmarkSummary
     median_improvement::Float64
 end
 
+"""
+    EndToEndRecord
+
+Per-section record from end-to-end validation.
+
+Fields:
+- `label`                         – section label
+- `input_equivalent_to_expected`  – whether the input expression matches
+                                    the expected compact form
+- `output_equivalent_to_expected` – whether the simplified expression
+                                    matches the expected compact form
+- `accepted`                      – whether simplify accepted the result
+- `score_before`                  – input expression cost
+- `score_after`                   – output expression cost
+"""
 Base.@kwdef struct EndToEndRecord
     label::String
     input_equivalent_to_expected::Bool
@@ -29,6 +91,17 @@ Base.@kwdef struct EndToEndRecord
     score_after::Float64
 end
 
+"""
+    EndToEndSummary
+
+Aggregate end-to-end validation results.
+
+Fields:
+- `records`                    – per-section records
+- `total`                      – total number of sections
+- `input_equivalence_passed`   – count of sections where input matches expected
+- `output_equivalence_passed`  – count of sections where output matches expected
+"""
 Base.@kwdef struct EndToEndSummary
     records::Vector{EndToEndRecord}
     total::Int
@@ -39,7 +112,8 @@ end
 """
     benchmark_cases()
 
-Return the initial benchmark corpus paths.
+Return the two registered benchmark case descriptors for the SW
+non-RWA corpus.
 """
 function benchmark_cases()
     root = normpath(joinpath(@__DIR__, ".."))
@@ -49,15 +123,24 @@ function benchmark_cases()
     )
 end
 
+# ---- Label normalisation ----
+
+"""
+    _normalize_expected_label(label)
+
+Normalise section labels from the expected-output file.  The labels may
+use Unicode superscripts and daggers that need mapping to match the SW
+input-file convention.
+"""
 function _normalize_expected_label(label::AbstractString)
     compact = replace(strip(label), " " => "")
     mapping = Dict(
         "1" => "identity",
         "a'a" => "a†a",
         "a'²" => "a†²",
-        "a²" => "a²",
+        "a²"  => "a²",
         "a'⁴" => "a†⁴",
-        "a⁴" => "a⁴",
+        "a⁴"  => "a⁴",
         "a'³a" => "a†³a",
         "a'a³" => "a†a³",
         "a'²a²" => "a†²a²",
@@ -65,6 +148,22 @@ function _normalize_expected_label(label::AbstractString)
     return get(mapping, compact, compact)
 end
 
+# ---- Expression parsing ----
+
+"""
+    _parse_symbolic_expression(raw; python_syntax)
+
+Parse an expression string into a symbolic expression.
+
+When `python_syntax` is true (expected-output format):
+  - `**` exponentiation is replaced with `^`
+  - `w` is replaced with `ω` (the detuning symbol used in this corpus)
+
+When false (input format): expressions use Julia syntax directly.
+
+Both formats convert `N//D` integer divisions to
+`BigInt(N)//BigInt(D)` to avoid Int64 overflow in rational arithmetic.
+"""
 function _parse_symbolic_expression(raw::AbstractString; python_syntax::Bool)
     expr_str = strip(raw)
     python_syntax && (expr_str = replace(expr_str, "**" => "^"))
@@ -83,6 +182,16 @@ function _parse_symbolic_expression(raw::AbstractString; python_syntax::Bool)
     return Core.eval(@__MODULE__, let_expr)
 end
 
+# ---- File loaders ----
+
+"""
+    _load_sw_sections(path)
+
+Load a file with `--- label ---` section delimiters.  Each section
+contains a single Julia-syntax expression.
+
+Returns a Dict{String, Any} mapping labels to parsed expressions.
+"""
 function _load_sw_sections(path::String)
     sections = Dict{String, Any}()
     current = ""
@@ -101,6 +210,15 @@ function _load_sw_sections(path::String)
     return sections
 end
 
+"""
+    _load_expected_sections(path)
+
+Load a file with `[label]` INI-style section headers.  Each section
+contains a single Python-syntax expression.
+
+Returns a Dict{String, Any} mapping normalised labels to parsed
+symbolic expressions.  Lines starting with `check ` are ignored.
+"""
 function _load_expected_sections(path::String)
     sections = Dict{String, Any}()
     lines = readlines(path)
@@ -126,6 +244,16 @@ function _load_expected_sections(path::String)
     return sections
 end
 
+# ---- End-to-end validation ----
+
+"""
+    run_end_to_end_validation(sw_path, expected_path; config=RunConfig())
+
+Run simplify on each section of the SW corpus and compare input and
+output expressions against the expected compact forms.
+
+Returns an `EndToEndSummary` with per-section records.
+"""
 function run_end_to_end_validation(
     sw_path::String = joinpath(normpath(joinpath(@__DIR__, "..")), "expressions/sw_nonrwa_order4_coeffs.txt"),
     expected_path::String = joinpath(normpath(joinpath(@__DIR__, "..")), "expressions/extracted_sw_nonrwa_coefficients_output.txt");
@@ -158,6 +286,16 @@ function run_end_to_end_validation(
     )
 end
 
+# ---- File format detection ----
+
+"""
+    _detect_file_format(path)
+
+Read the first non-empty, non-comment line and check whether the file
+uses SW sections (`--- label ---`) or expected sections (`[label]`).
+
+Returns `:sw_sections`, `:expected_sections`, or `:plain`.
+"""
 function _detect_file_format(path::String)
     section_line = ""
     for line in eachline(path)
@@ -175,6 +313,12 @@ function _detect_file_format(path::String)
     return :plain
 end
 
+"""
+    _load_case_expression(case::BenchmarkCase)
+
+Load the first expression from a BenchmarkCase file, auto-detecting
+the file format.
+"""
 function _load_case_expression(case::BenchmarkCase)
     if !isfile(case.expression_path)
         return nothing
@@ -200,11 +344,14 @@ function _load_case_expression(case::BenchmarkCase)
     end
 end
 
+# ---- Quick metrics ----
+
 """
     compute_quick_metrics(expr)
 
-Return a NamedTuple of lightweight metrics: node_count, operation_count,
-serialized_len, denominator_complexity, degree_profile, cse_potential.
+Return lightweight structural metrics for an expression:
+    (node_count, operation_count, serialized_len,
+     denominator_complexity, degree_profile, cse_potential)
 """
 function compute_quick_metrics(expr)
     t = expression_term(expr)
@@ -218,11 +365,13 @@ function compute_quick_metrics(expr)
     )
 end
 
+# ---- Section benchmarks ----
+
 """
     run_section_benchmark(label, input_expr; config=RunConfig())
 
-Run simplify on a single expression and return a NamedTuple with all key
-metrics for comparison.
+Run simplify on a single expression and return a NamedTuple with
+before/after metrics, validation status, and runtime.
 """
 function run_section_benchmark(label, input_expr; config::RunConfig = RunConfig())
     t_input = expression_term(input_expr)
@@ -252,6 +401,12 @@ function run_section_benchmark(label, input_expr; config::RunConfig = RunConfig(
     )
 end
 
+"""
+    print_section_report(report; io=stdout)
+
+Print a formatted single-line summary for one `run_section_benchmark`
+result.
+"""
 function print_section_report(report; io::IO = stdout)
     acc = report.accepted  ? "✓" : "✗"
     val = report.validated ? "✓" : "✗"
@@ -261,8 +416,8 @@ end
 """
     run_all_section_benchmarks(sections; config=RunConfig())
 
-Run `run_section_benchmark` on each (label, expr) pair and print results.
-Returns a Dict{String,NamedTuple} keyed by label.
+Run `run_section_benchmark` on each (label, expr) pair in the
+`sections` dict and print results.  Returns results keyed by label.
 """
 function run_all_section_benchmarks(sections; config::RunConfig = RunConfig())
     results = Dict{String,NamedTuple}()
@@ -279,6 +434,12 @@ function run_all_section_benchmarks(sections; config::RunConfig = RunConfig())
     return results
 end
 
+"""
+    print_benchmark_comparison(title, baseline, improved; io=stdout)
+
+Print a side-by-side comparison of two section-benchmark result dicts
+(e.g., before vs after a config change).
+"""
 function print_benchmark_comparison(title::AbstractString, baseline, improved; io::IO = stdout)
     println(io, "─"^80)
     println(io, "  $title")
@@ -301,6 +462,11 @@ function print_benchmark_comparison(title::AbstractString, baseline, improved; i
     println(io, "─"^80)
 end
 
+"""
+    run_benchmarks(; config=RunConfig())
+
+Run all registered benchmark cases and return a `BenchmarkSummary`.
+"""
 function run_benchmarks(; config::RunConfig = RunConfig())
     results = BenchmarkResult[]
     improvements = Float64[]

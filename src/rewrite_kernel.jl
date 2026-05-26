@@ -1,8 +1,37 @@
+# rewrite_kernel.jl — Rewrite-rule definitions, profiles, and the
+# targeted rational-simplification pipeline.
+#
+# This file owns:
+#   - The `AbstractRewriteProfile` hierarchy (safe / aggressive)
+#   - The deterministic rule registry built on SymbolicUtils `@rule`
+#   - Bounded rewrite engines: `apply_profile_rewrites`,
+#     `apply_targeted_rational_rewrites`, `apply_post_simplify`
+#
+# All rule applications are bounded by node-count limits to prevent
+# explosion on large expressions.
+
 abstract type AbstractRewriteProfile end
 
+# SafeRewriteProfile — identity/annihilator rules only (always
+#                          structure-preserving).
+# AggressiveRewriteProfile — includes safe rules plus cancellations
+#                              such as x/x → 1.
 struct SafeRewriteProfile <: AbstractRewriteProfile end
 struct AggressiveRewriteProfile <: AbstractRewriteProfile end
 
+"""
+    RegisteredRule{F}
+
+A named rule paired with a `family` tag for throttling and audit.
+
+Fields:
+- `id`       — unique Symbol identifier
+- `family`   – grouping key (`:safe_identity`, `:safe_annihilator`,
+               `:safe_algebraic`, `:aggressive_cancel`); limiters in
+               the search engine use this to cap candidates per family.
+- `rewriter` – callable that takes an expression and returns either a
+               rewritten expression or `nothing` (no match).
+"""
 Base.@kwdef struct RegisteredRule{F}
     id::Symbol
     family::Symbol
@@ -12,20 +41,30 @@ end
 """
     rewrite_rule_registry()
 
-Return deterministic safe and aggressive rewrite groups built on SymbolicUtils.
+Return a NamedTuple `(safe = ..., aggressive = ...)` containing
+deterministic rewrite rules built on SymbolicUtils' `@rule` macro.
+
+**Safe rules** – always correct, no structural risk:
+    x + 0 → x          0 + x → x          x - 0 → x
+    x * 1 → x          1 * x → x          x * 0 → 0
+    0 * x → 0          x / 1 → x          x - x → 0
+    x + x → 2x
+
+**Aggressive rules** – may change structure meaningfully:
+    x / x → 1          (via _self_division_rule)
 """
 function rewrite_rule_registry()
     safe_rules = (
         RegisteredRule(:add_zero_right, :safe_identity, @rule(~x + 0 => ~x)),
-        RegisteredRule(:add_zero_left, :safe_identity, @rule(0 + ~x => ~x)),
-        RegisteredRule(:sub_zero, :safe_identity, @rule(~x - 0 => ~x)),
-        RegisteredRule(:mul_one_right, :safe_identity, @rule(~x * 1 => ~x)),
-        RegisteredRule(:mul_one_left, :safe_identity, @rule(1 * ~x => ~x)),
+        RegisteredRule(:add_zero_left,  :safe_identity, @rule(0 + ~x => ~x)),
+        RegisteredRule(:sub_zero,       :safe_identity, @rule(~x - 0 => ~x)),
+        RegisteredRule(:mul_one_right,  :safe_identity, @rule(~x * 1 => ~x)),
+        RegisteredRule(:mul_one_left,   :safe_identity, @rule(1 * ~x => ~x)),
         RegisteredRule(:mul_zero_right, :safe_annihilator, @rule(~x * 0 => 0)),
-        RegisteredRule(:mul_zero_left, :safe_annihilator, @rule(0 * ~x => 0)),
-        RegisteredRule(:div_one, :safe_identity, @rule(~x / 1 => ~x)),
-        RegisteredRule(:sub_self, :safe_algebraic, @rule(~x - ~x => 0)),
-        RegisteredRule(:double_add, :safe_algebraic, @rule(~x + ~x => 2 * ~x)),
+        RegisteredRule(:mul_zero_left,  :safe_annihilator, @rule(0 * ~x => 0)),
+        RegisteredRule(:div_one,        :safe_identity, @rule(~x / 1 => ~x)),
+        RegisteredRule(:sub_self,       :safe_algebraic, @rule(~x - ~x => 0)),
+        RegisteredRule(:double_add,     :safe_algebraic, @rule(~x + ~x => 2 * ~x)),
     )
 
     aggressive_rules = (
@@ -35,8 +74,18 @@ function rewrite_rule_registry()
     return (safe = safe_rules, aggressive = aggressive_rules)
 end
 
+# ---- Internal helpers ----
+
+# Check whether `expr` is a call to the given function `op`.
 _rk_isop(op::Function, expr) = SymbolicUtils.iscall(expr) && SymbolicUtils.operation(expr) === op
 
+"""
+    _term_size(expr; limit=10_000)
+
+Count total nodes in an expression tree using an iterative stack.
+Returns `limit + 1` as a sentinel if the limit is exceeded, avoiding
+deep recursion on huge trees.
+"""
 function _term_size(expr; limit::Int = 10_000)
     total = 0
     stack = Any[expr]
@@ -51,6 +100,7 @@ function _term_size(expr; limit::Int = 10_000)
     return total
 end
 
+# Recursive check (bounded by `max_depth`) for division nodes.
 function _contains_division(expr; depth::Int = 0, max_depth::Int = 8)
     depth > max_depth && return false
     !_term_is_call(expr) && return false
@@ -63,6 +113,13 @@ end
 
 _term_is_call(expr) = SymbolicUtils.iscall(expr)
 
+"""
+    _rewrite_postwalk(expr, f)
+
+Bottom-up tree walk: apply `f` to each node after its children have
+been visited.  `f` returns `nothing` to leave the node unchanged,
+or a replacement expression.
+"""
 function _rewrite_postwalk(expr, f::Function)
     if !_term_is_call(expr)
         replacement = f(expr)
@@ -75,6 +132,13 @@ function _rewrite_postwalk(expr, f::Function)
     return replacement === nothing ? rebuilt : replacement
 end
 
+"""
+    _simplify_rational_node(node)
+
+Apply `simplify_fractions` and `quick_cancel` in sequence to a single
+tree node.  Both are part of SymbolicUtils and are safe for BigInt
+rational arithmetic.
+"""
 function _simplify_rational_node(node)
     current = node
     for op in (SymbolicUtils.simplify_fractions, SymbolicUtils.quick_cancel)
@@ -84,16 +148,20 @@ function _simplify_rational_node(node)
                 current = updated
             end
         catch
+            # Skip on error — the node may contain unsupported constructs
         end
     end
     return current
 end
 
-"""
-    apply_targeted_rational_rewrites(expr; max_sites=4, max_nodes=600)
+# ---- Hotspot detection / targeted rewriting ----
 
-Apply heavier rational simplifications only on bounded-size hotspots
-that contain division structure.
+"""
+    _score_hotspot(node)
+
+Score a division-containing subtree by `denominator_complexity / node_count`.
+Higher scores mean the denominator is relatively complex, making the
+subtree a promising target for rational simplification.
 """
 function _score_hotspot(node)
     den = _denominator_complexity(node)
@@ -101,6 +169,13 @@ function _score_hotspot(node)
     return den / max(n, 1)
 end
 
+"""
+    _collect_hotspots(expr; max_nodes=600)
+
+Walk the expression tree and collect all division-containing subtrees
+whose size is ≤ `max_nodes`, sorted by hotspot score descending.
+Only the top sites are later rewritten (see `apply_targeted_rational_rewrites`).
+"""
 function _collect_hotspots(expr; max_nodes::Int = 600)
     hotspots = Tuple{Float64, Any}[]
     _rewrite_postwalk(expr, node -> begin
@@ -114,6 +189,17 @@ function _collect_hotspots(expr; max_nodes::Int = 600)
     return hotspots
 end
 
+"""
+    apply_targeted_rational_rewrites(expr; max_sites=4, max_nodes=600)
+
+Apply `simplify_fractions` / `quick_cancel` to the highest-scored
+division hotspots in the expression tree, bounded by `max_sites`
+rewrites and `max_nodes` per subtree.  Results are memoised by hash
+to avoid redundant work.
+
+This is the main mechanism that handles large rational expressions
+without rewriting the entire tree.
+"""
 function apply_targeted_rational_rewrites(expr; max_sites::Int = 4, max_nodes::Int = 600)
     remaining = Ref(max_sites)
     memo = Dict{UInt64, Any}()
@@ -141,8 +227,17 @@ function apply_targeted_rational_rewrites(expr; max_sites::Int = 4, max_nodes::I
     end)
 end
 
+# ---- Self-division rule ----
+
 _self_division_rule(expr) = _rewrite_self_division(expr)
 
+"""
+    _rewrite_self_division(expr)
+
+Check whether `expr` is a division `x / x`.  If so, return the literal
+`1`.  This handles the symbolic case where SymbolicUtils' `@rule` may
+not match due to the lack of a `~x` pattern binder tolerance.
+"""
 function _rewrite_self_division(expr)
     if !SymbolicUtils.iscall(expr)
         return nothing
@@ -165,19 +260,22 @@ function _rewrite_self_division(expr)
     return nothing
 end
 
-function _profile_rules(profile::SafeRewriteProfile)
-    return rewrite_rule_registry().safe
-end
+# ---- Profile dispatch ----
 
-function _profile_rules(profile::AggressiveRewriteProfile)
-    registry = rewrite_rule_registry()
-    return (registry.safe..., registry.aggressive...)
+_profile_rules(::SafeRewriteProfile)      = rewrite_rule_registry().safe
+_profile_rules(::AggressiveRewriteProfile) = let r = rewrite_rule_registry()
+    (r.safe..., r.aggressive...)
 end
 
 """
     apply_profile_rewrites(expr; profile=SafeRewriteProfile(), max_passes=6)
 
-Apply deterministic rewrite passes for the selected profile.
+Apply the rewrite rules of the selected profile in a pre-walk (top-down)
+chain, repeating up to `max_passes` times.  Early termination when a
+pass produces no change.
+
+This is the main entry point for lightweight, bounded symbolic
+simplification by tree rewriting.
 """
 function apply_profile_rewrites(expr; profile::AbstractRewriteProfile = SafeRewriteProfile(), max_passes::Int = 6)
     current = expression_term(expr)
@@ -204,9 +302,12 @@ end
 """
     apply_post_simplify(expr; max_nodes=800, max_passes=4, timeout_secs=60.0)
 
-After beam search, apply `simplify_fractions` to division-containing
-subtrees bounded by max_nodes. Uses BigInt-coefficient-safe arithmetic.
-Returns the expression (possibly unchanged) and a summary NamedTuple.
+After the main beam search, apply `simplify_fractions` to
+division-containing subtrees bounded by `max_nodes`.  This pass uses
+BigInt-coefficient-safe arithmetic provided by SymbolicUtils.
+
+Returns a NamedTuple:
+    (expr, successful, attempted, elapsed_secs, timed_out)
 """
 function apply_post_simplify(expr; max_nodes::Int = 800, max_passes::Int = 4, timeout_secs::Float64 = 60.0)
     current = expression_term(expr)
@@ -258,6 +359,7 @@ end
 """
     rewrite_profiles()
 
-Return rewrite profile identifiers used by the orchestration layer.
+Return a tuple of (SafeRewriteProfile(), AggressiveRewriteProfile())
+for use by the orchestration layer in the search pipeline.
 """
 rewrite_profiles() = (SafeRewriteProfile(), AggressiveRewriteProfile())

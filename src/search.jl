@@ -1,5 +1,28 @@
+# search.jl — Beam-search pipeline and expression scoring.
+#
+# The main entry point `simplify(expr; config=RunConfig())` orchestrates:
+#   1. Beam-search expansion of rewrite candidates (depth-limited)
+#   2. Targeted rational rewriting of division hotspots
+#   3. Post-simplify `simplify_fractions` pass
+#   4. Recursive multi-pass convergence (growing subtree budget)
+#   5. Equivalence validation and trace recording
+
 const _MAX_TREE_DEPTH = 10_000
 
+"""
+    SearchStats
+
+Statistics collected during a single `simplify` run.
+
+Fields:
+- `expansions`       – number of candidate expressions generated
+- `visited`          – number of unique expressions stored (visited set size)
+- `depth_reached`    – final beam-search depth reached
+- `terminated_reason`– symbol indicating why the search stopped
+                       (:max_depth, :max_expansions, :max_nodes,
+                        :time_budget, :frontier_exhausted,
+                        :hard_case_escalation, :post_simplify)
+"""
 Base.@kwdef struct SearchStats
     expansions::Int = 0
     visited::Int = 0
@@ -7,6 +30,23 @@ Base.@kwdef struct SearchStats
     terminated_reason::Symbol = :unknown
 end
 
+"""
+    SimplificationResult
+
+Complete result of a `simplify(...)` call.
+
+Fields:
+- `input_expr`        – original expression (normalised form)
+- `best_expr`         – best expression found by the search
+- `accepted`          – whether the result passed validation AND improved the score
+- `score_before`      – cost of the input expression
+- `score_after`       – cost of `best_expr`
+- `validation_passed` – whether equivalence was validated
+- `worst_abs_error`   – largest absolute difference (NaN if symbolic check passed)
+- `worst_rel_error`   – largest relative difference (NaN if symbolic check passed)
+- `stats`             – SearchStats struct
+- `trace`             – TraceBuffer with the full event log
+"""
 Base.@kwdef struct SimplificationResult
     input_expr
     best_expr
@@ -20,13 +60,18 @@ Base.@kwdef struct SimplificationResult
     trace::TraceBuffer = TraceBuffer()
 end
 
+# ---- Operator matching ----
+
 _isop(op::Function, expr) = SymbolicUtils.iscall(expr) && SymbolicUtils.operation(expr) === op
+
+# ---- Cost-function components ----
+# Each component is a recursive tree walk bounded by _MAX_TREE_DEPTH.
 
 """
     _node_count(expr; _depth=0) -> Int
 
-Count total nodes in expression tree (1 + sum of child nodes).
-Returns 1 for leaf nodes (symbols, numbers). Bounded by `_MAX_TREE_DEPTH`.
+Total nodes in the expression tree (1 + sum of child nodes).
+Leaf nodes (symbols, numbers) contribute 1.
 """
 function _node_count(expr; _depth=0)
     _depth > _MAX_TREE_DEPTH && return 1
@@ -43,8 +88,7 @@ end
 """
     _operation_count(expr; _depth=0) -> Int
 
-Count operations in expression tree (1 per call node).
-Bounded by `_MAX_TREE_DEPTH`.
+Number of function-call (operator) nodes in the tree.
 """
 function _operation_count(expr; _depth=0)
     _depth > _MAX_TREE_DEPTH && return 0
@@ -61,8 +105,8 @@ end
 """
     _denominator_complexity(expr; _depth=0) -> Int
 
-Sum of node counts of denominators in division nodes.
-Bounded by `_MAX_TREE_DEPTH`.
+Sum of node counts of all denominators in division operators.
+A key metric: rational simplification aims to reduce this.
 """
 function _denominator_complexity(expr; _depth=0)
     _depth > _MAX_TREE_DEPTH && return 0
@@ -83,8 +127,7 @@ end
 """
     _degree_profile(expr; _depth=0) -> Int
 
-Sum of positive integer exponents in the expression tree.
-Bounded by `_MAX_TREE_DEPTH`.
+Sum of positive integer exponents in the tree (e.g., `x^3` → 3).
 """
 function _degree_profile(expr; _depth=0)
     _depth > _MAX_TREE_DEPTH && return 0
@@ -107,7 +150,10 @@ end
 """
     _cse_potential(expr) -> Int
 
-Estimate common-subexpression reduction potential by counting duplicate subtrees.
+Estimate common-subexpression potential by counting duplicate subtrees
+(via serialised form).  Each duplicate beyond the first contributes 1.
+This rewards expressions that share structure and therefore reduce
+evaluation cost.
 """
 function _cse_potential(expr)
     seen = Dict{String, Int}()
@@ -118,7 +164,7 @@ end
 """
     _collect_subtrees!(seen, expr; _depth=0)
 
-Recursively serialize and count all subtrees for `_cse_potential`.
+Recursively serialise and count all subtrees.  Used by `_cse_potential`.
 Bounded by `_MAX_TREE_DEPTH`.
 """
 function _collect_subtrees!(seen::Dict{String, Int}, expr; _depth=0)
@@ -133,6 +179,17 @@ function _collect_subtrees!(seen::Dict{String, Int}, expr; _depth=0)
     return seen
 end
 
+"""
+    expression_score(expr, w::ScoringWeights) -> Float64
+
+Weighted linear cost of an expression.  The search minimises this score.
+
+Score = w.node_count × node_count
+      + w.operation_count × operation_count
+      + w.denominator_complexity × denominator_complexity
+      + w.degree_profile × degree_profile
+      - w.cse_potential × cse_potential   (reward for shared structure)
+"""
 function expression_score(expr, w::ScoringWeights)
     node_count = _node_count(expr)
     operation_count = _operation_count(expr)
@@ -146,11 +203,14 @@ function expression_score(expr, w::ScoringWeights)
            w.cse_potential * cse_potential
 end
 
+# ---- Beam-search internals ----
+
 """
     _novelty_penalty(expr, visited) -> Int
 
-Count how many visited expressions share the same 16-character hash prefix,
-providing a diversity penalty. Uses `structural_hash` to match `visited` key format.
+Count how many previously visited expressions share the same 16-character
+hash prefix as the given expression.  This is used as a diversity bonus
+to penalise candidates that are too similar to already-explored ones.
 """
 function _novelty_penalty(expr, visited::Dict{String, Any})
     key = structural_hash(expr)
@@ -165,8 +225,9 @@ end
 """
     _ordered_frontier(candidates, config, visited) -> Vector
 
-Score, sort, and select the top-k candidates by beam width.
-Uses `(score, hash)` as deterministic sort key.
+Score all candidates with `expression_score` + novelty penalty, then
+sort by `(score, structural_hash)` for determinism, and keep the top
+`beam_width` entries.
 """
 function _ordered_frontier(candidates::Vector{Any}, config::RunConfig, visited::Dict{String, Any})
     scored = [(
@@ -179,6 +240,14 @@ function _ordered_frontier(candidates::Vector{Any}, config::RunConfig, visited::
     return [scored[i][1] for i in 1:width]
 end
 
+"""
+    _expand_candidate(expr, config; include_targeted=true) -> Tuple
+
+Generate candidate variants of `expr` by applying rewrite-profile passes
+and, if `include_targeted`, the staged rational pipeline.
+
+Returns a tuple of (candidate_expr, family_symbol) pairs.
+"""
 function _expand_candidate(expr, config::RunConfig; include_targeted::Bool = true)
     safe = apply_profile_rewrites(expr; profile = SafeRewriteProfile(), max_passes = 2)
     aggressive = apply_profile_rewrites(expr; profile = AggressiveRewriteProfile(), max_passes = 2)
@@ -197,6 +266,18 @@ function _expand_candidate(expr, config::RunConfig; include_targeted::Bool = tru
     return (base..., (staged_candidate, :staged_rational))
 end
 
+"""
+    _staged_rational_pipeline(expr, config) -> Expression
+
+Multi-step rational simplification pipeline:
+  1. Safe profile rewrites (clean identity/annihilator)
+  2. Targeted rational rewrites (top hotspot sites)
+  3. Repeat targeted rewrites at half the site count (if step 2 changed
+     the expression)
+  4. One final safe-rewrite pass
+
+This staging avoids wasting budget on large unchanged subtrees.
+"""
 function _staged_rational_pipeline(expr, config::RunConfig)
     current = expr
     step1 = apply_profile_rewrites(current; profile = SafeRewriteProfile(), max_passes = 2)
@@ -221,10 +302,35 @@ function _staged_rational_pipeline(expr, config::RunConfig)
 end
 
 """
-    simplify(expr; config=RunConfig())
+    simplify(expr; config=RunConfig()) -> SimplificationResult
 
-Entry point for TreeSimplify's search pipeline. The current scaffold is
-deterministic and returns a no-op result until the beam search engine lands.
+Main entry point for TreeSimplify.  The pipeline:
+
+**Phase 1 — Beam search** (up to `budget.max_depth` iterations):
+   - Maintain a frontier of `beam_width` best candidates.
+   - At each depth, expand every frontier candidate with safe rewrites,
+     aggressive rewrites, and (optionally) staged rational rewrites.
+   - Score each generated candidate; keep the best-scoring one.
+   - Prune by `rule_family_throttle` to avoid domination by one family.
+   - Stop when any budget limit (nodes, expansions, time, depth) is hit.
+
+**Phase 2 — Hard-case escalation** (optional):
+   - If the beam search produced no improvement and `enable_hard_case_escalation`
+     is true, apply a strong aggressive rewrite pass.
+
+**Phase 3 — Post-simplify**:
+   - Apply `simplify_fractions` to bounded division-containing subtrees.
+
+**Phase 4 — Multi-pass convergence**:
+   - If `simplify_max_passes > 1`, recurse on the best expression with
+     a larger `post_simplify_max_nodes` budget (multiplied by
+     `simplify_pass_nodes_growth` per pass).
+
+**Phase 5 — Validation**:
+   - Compare best expression to input via symbolic equivalence or
+     random numeric sampling.
+
+All events are recorded in the returned `TraceBuffer`.
 """
 function simplify(expr; config::RunConfig = RunConfig())
     symbolic_expr = expression_term(expr)
@@ -246,6 +352,8 @@ function simplify(expr; config::RunConfig = RunConfig())
 
     for depth in 1:config.budget.max_depth
         depth_reached = depth
+
+        # Stop if frontier is empty or time budget exhausted.
         if isempty(frontier)
             reason = :frontier_exhausted
             break
@@ -255,11 +363,15 @@ function simplify(expr; config::RunConfig = RunConfig())
             break
         end
 
+        # Disable targeted rational rewrites if we've had a streak of
+        # unproductive depths (avoids burning budget on futile hotspot scans).
         if include_targeted && targeted_improvement_streak >= config.targeted_disable_streak
             include_targeted = false
             push_event!(trace, :targeted_disabled, payload = (depth = depth, streak = targeted_improvement_streak))
         end
 
+        # Expand each frontier element.  Only the first few elements get
+        # the (expensive) targeted rational pipeline if it's enabled.
         targeted_limit = min(2, length(frontier))
         expanded = [
             _expand_candidate(
@@ -274,16 +386,20 @@ function simplify(expr; config::RunConfig = RunConfig())
         for pair in expanded
             for candidate in pair
                 cand, family = candidate
+
+                # Throttle: limit candidates per rewrite family per depth.
                 family_count = get(family_counts, family, 0)
                 if family_count >= config.rule_family_throttle
                     continue
                 end
+
                 hash = structural_hash(cand)
                 if !haskey(visited, hash)
                     visited[hash] = cand
                     family_counts[family] = family_count + 1
                     push!(next_candidates, cand)
                     expansions += 1
+
                     score = expression_score(cand, config.scoring)
                     push_event!(trace, :candidate_generated, payload = (depth = depth, family = family, hash = hash, score = score))
                     if score < best_score
@@ -292,6 +408,8 @@ function simplify(expr; config::RunConfig = RunConfig())
                         depth_improved = true
                         push_event!(trace, :best_updated, payload = (depth = depth, hash = hash, score = score))
                     end
+
+                    # Check global budget limits.
                     if expansions >= config.budget.max_expansions || length(visited) >= config.budget.max_nodes
                         reason = expansions >= config.budget.max_expansions ? :max_expansions : :max_nodes
                         break
@@ -317,6 +435,7 @@ function simplify(expr; config::RunConfig = RunConfig())
         push_event!(trace, :depth_completed, payload = (depth = depth, frontier = length(frontier), visited = length(visited)))
     end
 
+    # Optional hard-case escalation: if no improvement, try aggressive rewrites.
     if config.enable_hard_case_escalation && best_score >= before_score
         escalated = apply_profile_rewrites(best_expr; profile = AggressiveRewriteProfile(), max_passes = 6)
         esc_score = expression_score(escalated, config.scoring)
@@ -328,6 +447,7 @@ function simplify(expr; config::RunConfig = RunConfig())
         end
     end
 
+    # Post-simplify: apply simplify_fractions to division hotspots.
     post_result = apply_post_simplify(
         best_expr;
         max_nodes = config.post_simplify_max_nodes,
@@ -344,6 +464,7 @@ function simplify(expr; config::RunConfig = RunConfig())
         reason = :post_simplify
     end
 
+    # Multi-pass convergence: recurse with larger node budget.
     if config.simplify_max_passes > 1 && structural_hash(best_expr) != structural_hash(symbolic_expr)
         remaining_passes = config.simplify_max_passes - 1
         next_max_nodes = round(Int, config.post_simplify_max_nodes * config.simplify_pass_nodes_growth)
@@ -371,13 +492,14 @@ function simplify(expr; config::RunConfig = RunConfig())
             best_score = next_result.score_after
             reason = next_result.stats.terminated_reason
             expansions += next_result.stats.expansions
-            # Merge trace events from recursive pass
+            # Merge trace events from the recursive pass.
             for ev in next_result.trace.events
                 push_event!(trace, ev.event, payload = ev.payload)
             end
         end
     end
 
+    # Final validation and result construction.
     after_score = expression_score(best_expr, config.scoring)
     report = validate_equivalence(symbolic_expr, best_expr, config)
     improvement = before_score - after_score
