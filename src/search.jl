@@ -7,7 +7,7 @@
 #   4. Recursive multi-pass convergence (growing subtree budget)
 #   5. Equivalence validation and trace recording
 
-const _MAX_TREE_DEPTH = 10_000
+# Cost-function components are now defined in core_expr.jl.
 
 """
     SearchStats
@@ -60,179 +60,31 @@ Base.@kwdef struct SimplificationResult
     trace::TraceBuffer = TraceBuffer()
 end
 
-# ---- Operator matching ----
-
-_isop(op::Function, expr) = SymbolicUtils.iscall(expr) && SymbolicUtils.operation(expr) === op
-
-# ---- Cost-function components ----
-# Each component is a recursive tree walk bounded by _MAX_TREE_DEPTH.
-
-"""
-    _node_count(expr; _depth=0) -> Int
-
-Total nodes in the expression tree (1 + sum of child nodes).
-Leaf nodes (symbols, numbers) contribute 1.
-"""
-function _node_count(expr; _depth=0)
-    _depth > _MAX_TREE_DEPTH && return 1
-    if !SymbolicUtils.iscall(expr)
-        return 1
-    end
-    total = 1
-    for arg in SymbolicUtils.arguments(expr)
-        total += _node_count(arg; _depth=_depth+1)
-    end
-    return total
-end
-
-"""
-    _operation_count(expr; _depth=0) -> Int
-
-Number of function-call (operator) nodes in the tree.
-"""
-function _operation_count(expr; _depth=0)
-    _depth > _MAX_TREE_DEPTH && return 0
-    if !SymbolicUtils.iscall(expr)
-        return 0
-    end
-    total = 1
-    for arg in SymbolicUtils.arguments(expr)
-        total += _operation_count(arg; _depth=_depth+1)
-    end
-    return total
-end
-
-"""
-    _denominator_complexity(expr; _depth=0) -> Int
-
-Sum of node counts of all denominators in division operators.
-A key metric: rational simplification aims to reduce this.
-"""
-function _denominator_complexity(expr; _depth=0)
-    _depth > _MAX_TREE_DEPTH && return 0
-    if !SymbolicUtils.iscall(expr)
-        return 0
-    end
-    total = 0
-    if _isop(/, expr)
-        den = SymbolicUtils.arguments(expr)[2]
-        total += _node_count(den)
-    end
-    for arg in SymbolicUtils.arguments(expr)
-        total += _denominator_complexity(arg; _depth=_depth+1)
-    end
-    return total
-end
-
-"""
-    _degree_profile(expr; _depth=0) -> Int
-
-Sum of positive integer exponents in the tree (e.g., `x^3` → 3).
-"""
-function _degree_profile(expr; _depth=0)
-    _depth > _MAX_TREE_DEPTH && return 0
-    if !SymbolicUtils.iscall(expr)
-        return 0
-    end
-    total = 0
-    if _isop(^, expr)
-        pow = SymbolicUtils.arguments(expr)[2]
-        if pow isa Integer
-            total += max(pow, 0)
-        end
-    end
-    for arg in SymbolicUtils.arguments(expr)
-        total += _degree_profile(arg; _depth=_depth+1)
-    end
-    return total
-end
-
-"""
-    _cse_potential(expr) -> Int
-
-Estimate common-subexpression potential by counting duplicate subtrees
-(via serialised form).  Each duplicate beyond the first contributes 1.
-This rewards expressions that share structure and therefore reduce
-evaluation cost.
-"""
-function _cse_potential(expr)
-    seen = Dict{String, Int}()
-    _collect_subtrees!(seen, expr)
-    return sum((v - 1 for v in values(seen) if v > 1); init = 0)
-end
-
-"""
-    _collect_subtrees!(seen, expr; _depth=0)
-
-Recursively serialise and count all subtrees.  Used by `_cse_potential`.
-Bounded by `_MAX_TREE_DEPTH`.
-"""
-function _collect_subtrees!(seen::Dict{String, Int}, expr; _depth=0)
-    _depth > _MAX_TREE_DEPTH && return seen
-    key = stable_serialize(expr)
-    seen[key] = get(seen, key, 0) + 1
-    if SymbolicUtils.iscall(expr)
-        for arg in SymbolicUtils.arguments(expr)
-            _collect_subtrees!(seen, arg; _depth=_depth+1)
-        end
-    end
-    return seen
-end
-
-"""
-    expression_score(expr, w::ScoringWeights) -> Float64
-
-Weighted linear cost of an expression.  The search minimises this score.
-
-Score = w.node_count × node_count
-      + w.operation_count × operation_count
-      + w.denominator_complexity × denominator_complexity
-      + w.degree_profile × degree_profile
-      - w.cse_potential × cse_potential   (reward for shared structure)
-"""
-function expression_score(expr, w::ScoringWeights)
-    node_count = _node_count(expr)
-    operation_count = _operation_count(expr)
-    denominator_complexity = _denominator_complexity(expr)
-    degree_profile = _degree_profile(expr)
-    cse_potential = _cse_potential(expr)
-    return w.node_count * node_count +
-           w.operation_count * operation_count +
-           w.denominator_complexity * denominator_complexity +
-           w.degree_profile * degree_profile -
-           w.cse_potential * cse_potential
-end
-
 # ---- Beam-search internals ----
 
 """
-    _novelty_penalty(expr, visited) -> Int
+    _novelty_penalty(expr, prefix_counts) -> Int
 
-Count how many previously visited expressions share the same 16-character
-hash prefix as the given expression.  This is used as a diversity bonus
-to penalise candidates that are too similar to already-explored ones.
+Return the count of previously visited expressions sharing the same
+16-character hash prefix.  Uses a pre-computed prefix histogram for
+O(1) lookup instead of scanning the entire visited set.
 """
-function _novelty_penalty(expr, visited::Dict{String, Any})
-    key = structural_hash(expr)
-    prefix = first(key, 16)
-    similar = 0
-    for existing in keys(visited)
-        startswith(existing, prefix) && (similar += 1)
-    end
-    return similar
+function _novelty_penalty(expr, prefix_counts::Dict{String, Int})
+    prefix = first(structural_hash(expr), 16)
+    return get(prefix_counts, prefix, 0)
 end
 
 """
-    _ordered_frontier(candidates, config, visited) -> Vector
+    _ordered_frontier(candidates, config, prefix_counts) -> Vector
 
 Score all candidates with `expression_score` + novelty penalty, then
 sort by `(score, structural_hash)` for determinism, and keep the top
 `beam_width` entries.
 """
-function _ordered_frontier(candidates::Vector{Any}, config::RunConfig, visited::Dict{String, Any})
+function _ordered_frontier(candidates::Vector{Any}, config::RunConfig, prefix_counts::Dict{String, Int})
     scored = [(
         c,
-        expression_score(c, config.scoring) + config.novelty_penalty * _novelty_penalty(c, visited),
+        expression_score(c, config.scoring) + config.novelty_penalty * _novelty_penalty(c, prefix_counts),
         structural_hash(c),
     ) for c in candidates]
     sort!(scored, by = x -> (x[2], x[3]))
@@ -333,7 +185,24 @@ Main entry point for TreeSimplify.  The pipeline:
 All events are recorded in the returned `TraceBuffer`.
 """
 function simplify(expr; config::RunConfig = RunConfig())
+    validate_config(config)
     symbolic_expr = expression_term(expr)
+
+    # Short-circuit trivial inputs (single numbers, plain symbols).
+    if !SymbolicUtils.iscall(symbolic_expr)
+        score = expression_score(symbolic_expr, config.scoring)
+        trace = TraceBuffer()
+        push_event!(trace, :run_started)
+        push_event!(trace, :run_finished, payload = (reason = :trivial, score_before = score, score_after = score))
+        return SimplificationResult(
+            input_expr = symbolic_expr, best_expr = symbolic_expr,
+            accepted = true, score_before = score, score_after = score,
+            validation_passed = true,
+            stats = SearchStats(visited = 1, terminated_reason = :trivial),
+            trace = trace,
+        )
+    end
+
     trace = TraceBuffer()
     push_event!(trace, :run_started, payload = (seed = config.seed, beam_width = config.budget.beam_width))
 
@@ -341,7 +210,10 @@ function simplify(expr; config::RunConfig = RunConfig())
     before_score = expression_score(symbolic_expr, config.scoring)
     best_expr = symbolic_expr
     best_score = before_score
-    visited = Dict{String, Any}(structural_hash(symbolic_expr) => symbolic_expr)
+    init_h = structural_hash(symbolic_expr)
+    visited = Dict{String, Any}(init_h => symbolic_expr)
+    prefix_counts = Dict{String, Int}(first(init_h, 16) => 1)
+    visited_count = 1
     frontier = [symbolic_expr]
     expansions = 0
     depth_reached = 0
@@ -393,20 +265,23 @@ function simplify(expr; config::RunConfig = RunConfig())
                     continue
                 end
 
-                hash = structural_hash(cand)
-                if !haskey(visited, hash)
-                    visited[hash] = cand
+                cand_hash = structural_hash(cand)
+                if !haskey(visited, cand_hash)
+                    visited[cand_hash] = cand
+                    visited_count += 1
+                    prefix = first(cand_hash, 16)
+                    prefix_counts[prefix] = get(prefix_counts, prefix, 0) + 1
                     family_counts[family] = family_count + 1
                     push!(next_candidates, cand)
                     expansions += 1
 
                     score = expression_score(cand, config.scoring)
-                    push_event!(trace, :candidate_generated, payload = (depth = depth, family = family, hash = hash, score = score))
+                    push_event!(trace, :candidate_generated, payload = (depth = depth, family = family, hash = cand_hash, score = score))
                     if score < best_score
                         best_expr = cand
                         best_score = score
                         depth_improved = true
-                        push_event!(trace, :best_updated, payload = (depth = depth, hash = hash, score = score))
+                        push_event!(trace, :best_updated, payload = (depth = depth, hash = cand_hash, score = score))
                     end
 
                     # Check global budget limits.
@@ -430,7 +305,7 @@ function simplify(expr; config::RunConfig = RunConfig())
         if reason in (:max_expansions, :max_nodes)
             break
         end
-        frontier = _ordered_frontier(next_candidates, config, visited)
+        frontier = _ordered_frontier(next_candidates, config, prefix_counts)
         empty!(family_counts)
         push_event!(trace, :depth_completed, payload = (depth = depth, frontier = length(frontier), visited = length(visited)))
     end
@@ -487,11 +362,13 @@ function simplify(expr; config::RunConfig = RunConfig())
             simplify_pass_nodes_growth = config.simplify_pass_nodes_growth,
         )
         next_result = simplify(best_expr; config = next_config)
-        if next_result.score_after < best_score
+        if next_result.validation_passed && next_result.score_after < best_score
             best_expr = next_result.best_expr
             best_score = next_result.score_after
             reason = next_result.stats.terminated_reason
             expansions += next_result.stats.expansions
+            visited_count += next_result.stats.visited
+            depth_reached = max(depth_reached, next_result.stats.depth_reached)
             # Merge trace events from the recursive pass.
             for ev in next_result.trace.events
                 push_event!(trace, ev.event, payload = ev.payload)
@@ -508,7 +385,7 @@ function simplify(expr; config::RunConfig = RunConfig())
     push_event!(trace, :run_finished, payload = (reason = reason, accepted = accepted, score_before = before_score, score_after = after_score))
     stats = SearchStats(
         expansions = expansions,
-        visited = length(visited),
+        visited = visited_count,
         depth_reached = depth_reached,
         terminated_reason = reason,
     )

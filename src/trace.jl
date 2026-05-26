@@ -101,6 +101,10 @@ end
     load_artifact(path) -> RunArtifact
 
 Deserialise a RunArtifact from a file.
+
+**Security note:** Uses Julia's native `Serialization.deserialize`,
+which can execute arbitrary code during loading.  Only load artifacts
+from trusted sources.
 """
 function load_artifact(path::AbstractString)
     open(path, "r") do io

@@ -168,7 +168,7 @@ function _parse_symbolic_expression(raw::AbstractString; python_syntax::Bool)
     expr_str = strip(raw)
     python_syntax && (expr_str = replace(expr_str, "**" => "^"))
     python_syntax && (expr_str = replace(expr_str, r"\bw\b" => "ω"))
-    expr_str = replace(expr_str, r"(\d+)//(\d+)" => s"BigInt(\1)//BigInt(\2)")
+    expr_str = replace(expr_str, r"(-?\d+)//(-?\d+)" => s"BigInt(\1)//BigInt(\2)")
     parsed = Meta.parse(expr_str)
     g1, g2, d1, d3, ω = let
         @variables g1 g2 d1 d3 ω
@@ -355,12 +355,13 @@ Return lightweight structural metrics for an expression:
 """
 function compute_quick_metrics(expr)
     t = expression_term(expr)
+    nc, oc, dc, dg = _expression_metrics(t)
     return (
-        node_count = _node_count(t),
-        operation_count = _operation_count(t),
+        node_count = nc,
+        operation_count = oc,
         serialized_len = length(stable_serialize(t)),
-        denominator_complexity = _denominator_complexity(t),
-        degree_profile = _degree_profile(t),
+        denominator_complexity = dc,
+        degree_profile = dg,
         cse_potential = _cse_potential(t),
     )
 end

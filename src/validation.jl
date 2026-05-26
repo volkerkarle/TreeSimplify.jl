@@ -72,7 +72,7 @@ expressions.
 """
 function _symbolic_equivalent(a, b)
     diff_expr = Symbolics.simplify(a - b)
-    return diff_expr == 0
+    return iszero(diff_expr)
 end
 
 """

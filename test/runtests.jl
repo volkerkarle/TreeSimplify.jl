@@ -42,7 +42,9 @@ using Symbolics
     # ---- Stable serialisation and hashing ----
     serialized = stable_serialize(x + x)
     @test !isempty(serialized)
-    @test structural_hash(x + x) == structural_hash(2x)
+    @test structural_hash(x + x) == structural_hash(2x)  # Symbolics auto-simplifies x+x → 2x
+    @variables y
+    @test structural_hash(x + y) != structural_hash(x + x)
 
     # ---- Rewrite rule registry ----
     registry = rewrite_rule_registry()
@@ -127,5 +129,46 @@ using Symbolics
 
         # simplify rejects plain strings
         @test_throws MethodError TreeSimplify.simplify("invalid")
+
+        # ---- Short-circuit trivial inputs ----
+        const_result = TreeSimplify.simplify(42)
+        @test const_result.stats.visited == 1
+        @test const_result.stats.terminated_reason == :trivial
+        @test const_result.best_expr == 42
+
+        var_result = TreeSimplify.simplify(x)
+        @test var_result.stats.visited == 1
+        @test var_result.stats.terminated_reason == :trivial
+        @test isequal(var_result.best_expr, x)
+
+        # ---- Timeout termination ----
+        timeout_cfg = RunConfig(
+            budget = SearchBudget(max_depth = 10, beam_width = 256, max_expansions = 50000, max_nodes = 50000, max_time_seconds = 0.001),
+            validation = ValidationConfig(symbolic_first = false, numerical_fallback = true, random_samples = 3),
+        )
+        expr_large = (x + 1)^6
+        timeout_result = TreeSimplify.simplify(expr_large; config = timeout_cfg)
+        @test timeout_result.stats.terminated_reason == :time_budget
+        @test timeout_result.stats.visited >= 1
+        @test timeout_result.stats.expansions >= 0
+
+        # ---- Rule throttle (max_sites = 0) ----
+        @variables z
+        division_expr = (z + 1) / (z + 1)
+        throttled = TreeSimplify.apply_targeted_rational_rewrites(division_expr; max_sites = 0)
+        # With max_sites=0, no hotspot should be rewritten; expression unchanged.
+        h_orig = structural_hash(division_expr)
+        h_throttled = structural_hash(throttled)
+        @test h_orig == h_throttled
+
+        # ---- Multi-pass validation ----
+        multi_cfg = RunConfig(
+            budget = SearchBudget(max_depth = 3, beam_width = 16, max_expansions = 50, max_nodes = 500, max_time_seconds = 30.0),
+            validation = ValidationConfig(symbolic_first = true, numerical_fallback = false, random_samples = 0),
+        )
+        first_pass = TreeSimplify.simplify((x + x) / (x + x); config = multi_cfg)
+        @test first_pass.validation_passed
+        second_pass = TreeSimplify.simplify(first_pass.best_expr; config = multi_cfg)
+        @test second_pass.validation_passed
     end
 end

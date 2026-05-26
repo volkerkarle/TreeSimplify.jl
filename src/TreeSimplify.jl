@@ -24,13 +24,13 @@ using Statistics
 using Printf
 
 # Sub-modules for each layer of the pipeline.
-include("config.jl")          # RunConfig, SearchBudget, ValidationConfig, ScoringWeights
-include("core_expr.jl")       # expression_term, stable_serialize, structural_hash
-include("rewrite_kernel.jl")   # Rewrite profiles, rule registry, targeted rational rewriting
-include("trace.jl")            # TraceEvent, TraceBuffer, RunArtifact – audit trail
-include("search.jl")           # simplify() – the main beam search entry point
-include("validation.jl")       # validate_equivalence – symbolic + numeric fallback
-include("benchmarks.jl")       # BenchmarkCase, EndToEndSummary, run_benchmarks, corpus loading
+include("config.jl")            # RunConfig, SearchBudget, ValidationConfig, ScoringWeights
+include("core_expr.jl")         # expression_term, stable_serialize, structural_hash, metrics
+include("trace.jl")             # TraceEvent, TraceBuffer, RunArtifact – audit trail
+include("validation.jl")        # validate_equivalence – symbolic + numeric fallback
+include("rewrite_kernel.jl")    # Rewrite profiles, rule registry, targeted rational rewriting
+include("search.jl")            # simplify() – the main beam search entry point
+include("benchmarks.jl")        # BenchmarkCase, EndToEndSummary, run_benchmarks, corpus loading
 
 # ---- Configuration ----
 export RunConfig

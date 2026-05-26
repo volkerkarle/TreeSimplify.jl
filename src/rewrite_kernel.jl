@@ -38,6 +38,39 @@ Base.@kwdef struct RegisteredRule{F}
     rewriter::F
 end
 
+# ---- Self-division rule (must precede rewrite_rule_registry for const init) ----
+
+_self_division_rule(expr) = _rewrite_self_division(expr)
+
+"""
+    _rewrite_self_division(expr)
+
+Check whether `expr` is a division `x / x`.  If so, return the literal
+`1`.  This handles the symbolic case where SymbolicUtils' `@rule` may
+not match due to the lack of a `~x` pattern binder tolerance.
+"""
+function _rewrite_self_division(expr)
+    if !SymbolicUtils.iscall(expr)
+        return nothing
+    end
+    op = SymbolicUtils.operation(expr)
+    if op != /
+        return nothing
+    end
+    args = SymbolicUtils.arguments(expr)
+    if length(args) != 2
+        return nothing
+    end
+    num, den = args
+    if den isa Number && iszero(den)
+        return nothing
+    end
+    if isequal(num, den)
+        return 1
+    end
+    return nothing
+end
+
 """
     rewrite_rule_registry()
 
@@ -74,10 +107,11 @@ function rewrite_rule_registry()
     return (safe = safe_rules, aggressive = aggressive_rules)
 end
 
+const _RULE_REGISTRY = rewrite_rule_registry()
+
 # ---- Internal helpers ----
 
 # Check whether `expr` is a call to the given function `op`.
-_rk_isop(op::Function, expr) = SymbolicUtils.iscall(expr) && SymbolicUtils.operation(expr) === op
 
 """
     _term_size(expr; limit=10_000)
@@ -104,7 +138,7 @@ end
 function _contains_division(expr; depth::Int = 0, max_depth::Int = 8)
     depth > max_depth && return false
     !_term_is_call(expr) && return false
-    _rk_isop(/, expr) && return true
+    _isop(/, expr) && return true
     for arg in SymbolicUtils.arguments(expr)
         _contains_division(arg; depth = depth + 1, max_depth = max_depth) && return true
     end
@@ -116,20 +150,42 @@ _term_is_call(expr) = SymbolicUtils.iscall(expr)
 """
     _rewrite_postwalk(expr, f)
 
-Bottom-up tree walk: apply `f` to each node after its children have
-been visited.  `f` returns `nothing` to leave the node unchanged,
-or a replacement expression.
+Bottom-up (post-order) tree walk using an explicit stack.
+`f` is called on every node after its children have been visited.
+Returns `f`'s return value if non-nothing, otherwise the (possibly
+rebuilt) node unchanged.  Iterative — safe for arbitrarily deep trees.
 """
 function _rewrite_postwalk(expr, f::Function)
-    if !_term_is_call(expr)
-        replacement = f(expr)
-        return replacement === nothing ? expr : replacement
+    # Explicit stack of (node, state) pairs.
+    # Uses `Any` for the node slot because `arguments(...)` may return
+    # arithmetic leaf types (e.g. Rational{BigInt}) alongside BasicSymbolic.
+    stack = Vector{Tuple{Any, Symbol}}()
+    push!(stack, (expr, :enter))
+    rebuilt = IdDict()
+
+    while !isempty(stack)
+        node, state = pop!(stack)
+
+        if !_term_is_call(node)
+            r = f(node)
+            rebuilt[node] = r === nothing ? node : r
+            continue
+        end
+
+        if state === :enter
+            push!(stack, (node, :exit))
+            for arg in reverse(SymbolicUtils.arguments(node))
+                push!(stack, (arg, :enter))
+            end
+        else
+            new_args = Any[rebuilt[arg] for arg in SymbolicUtils.arguments(node)]
+            r_expr = SymbolicUtils.operation(node)(new_args...)
+            r = f(r_expr)
+            rebuilt[node] = r === nothing ? r_expr : r
+        end
     end
-    args = SymbolicUtils.arguments(expr)
-    new_args = map(arg -> _rewrite_postwalk(arg, f), args)
-    rebuilt = SymbolicUtils.operation(expr)(new_args...)
-    replacement = f(rebuilt)
-    return replacement === nothing ? rebuilt : replacement
+
+    return rebuilt[expr]
 end
 
 """
@@ -147,8 +203,9 @@ function _simplify_rational_node(node)
             if updated !== nothing
                 current = updated
             end
-        catch
-            # Skip on error — the node may contain unsupported constructs
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "simplify_fractions/quick_cancel failed" node = structural_hash(node) exception = e
         end
     end
     return current
@@ -202,12 +259,12 @@ without rewriting the entire tree.
 """
 function apply_targeted_rational_rewrites(expr; max_sites::Int = 4, max_nodes::Int = 600)
     remaining = Ref(max_sites)
-    memo = Dict{UInt64, Any}()
+    memo = Dict{String, Any}()
     return _rewrite_postwalk(expr, node -> begin
         remaining[] <= 0 && return nothing
         _term_size(node; limit = max_nodes) > max_nodes && return nothing
         _contains_division(node) || return nothing
-        h = hash(node)
+        h = structural_hash(node)
         if haskey(memo, h)
             cached = memo[h]
             if cached !== nothing && structural_hash(cached) != structural_hash(node)
@@ -227,45 +284,10 @@ function apply_targeted_rational_rewrites(expr; max_sites::Int = 4, max_nodes::I
     end)
 end
 
-# ---- Self-division rule ----
-
-_self_division_rule(expr) = _rewrite_self_division(expr)
-
-"""
-    _rewrite_self_division(expr)
-
-Check whether `expr` is a division `x / x`.  If so, return the literal
-`1`.  This handles the symbolic case where SymbolicUtils' `@rule` may
-not match due to the lack of a `~x` pattern binder tolerance.
-"""
-function _rewrite_self_division(expr)
-    if !SymbolicUtils.iscall(expr)
-        return nothing
-    end
-    op = SymbolicUtils.operation(expr)
-    if op != /
-        return nothing
-    end
-    args = SymbolicUtils.arguments(expr)
-    if length(args) != 2
-        return nothing
-    end
-    num, den = args
-    if den isa Number && iszero(den)
-        return nothing
-    end
-    if isequal(num, den)
-        return 1
-    end
-    return nothing
-end
-
 # ---- Profile dispatch ----
 
-_profile_rules(::SafeRewriteProfile)      = rewrite_rule_registry().safe
-_profile_rules(::AggressiveRewriteProfile) = let r = rewrite_rule_registry()
-    (r.safe..., r.aggressive...)
-end
+_profile_rules(::SafeRewriteProfile)      = _RULE_REGISTRY.safe
+_profile_rules(::AggressiveRewriteProfile) = (_RULE_REGISTRY.safe..., _RULE_REGISTRY.aggressive...)
 
 """
     apply_profile_rewrites(expr; profile=SafeRewriteProfile(), max_passes=6)
@@ -287,9 +309,6 @@ function apply_profile_rewrites(expr; profile::AbstractRewriteProfile = SafeRewr
     for _ in 1:max_passes
         before = structural_hash(current)
         rewritten = pipeline(current)
-        if rewritten === nothing
-            break
-        end
         current = rewritten
         after = structural_hash(current)
         if before == after
@@ -327,7 +346,9 @@ function apply_post_simplify(expr; max_nodes::Int = 800, max_passes::Int = 4, ti
             _contains_division(node) || return nothing
             candidate = try
                 SymbolicUtils.simplify_fractions(node)
-            catch
+            catch e
+                e isa InterruptException && rethrow()
+                @debug "simplify_fractions failed in post_simplify" node = structural_hash(node) exception = e
                 nothing
             end
             if candidate === nothing || structural_hash(candidate) == structural_hash(node)

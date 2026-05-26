@@ -37,7 +37,6 @@ Fields:
                          is inconclusive or not attempted
 - `random_samples`      – number of random substitution points (only used when
                           numerical_fallback is true)
-- `precision_bits`      – target bit width for BigInt / BigFloat sampling
 - `guard_singularities` – skip sample points where either expression is non-finite
 - `abs_tolerance`       – worst allowed absolute difference
 - `rel_tolerance`       – worst allowed relative difference
@@ -47,7 +46,6 @@ Base.@kwdef struct ValidationConfig
     symbolic_first::Bool = true
     numerical_fallback::Bool = true
     random_samples::Int = 24
-    precision_bits::Int = 256
     guard_singularities::Bool = true
     abs_tolerance::Float64 = 1e-8
     rel_tolerance::Float64 = 1e-8
@@ -119,4 +117,26 @@ Base.@kwdef struct RunConfig
     post_simplify_timeout_secs::Float64 = 60.0
     simplify_max_passes::Int = 3
     simplify_pass_nodes_growth::Float64 = 2.5
+end
+
+"""
+    validate_config(config)
+
+Assert that all `RunConfig` numeric fields have sane positive values.
+Throws an `ArgumentError` if any check fails.
+"""
+function validate_config(config::RunConfig)
+    b = config.budget
+    b.max_nodes > 0 || throw(ArgumentError("max_nodes must be positive, got $(b.max_nodes)"))
+    b.max_expansions > 0 || throw(ArgumentError("max_expansions must be positive, got $(b.max_expansions)"))
+    b.max_depth > 0 || throw(ArgumentError("max_depth must be positive, got $(b.max_depth)"))
+    b.max_time_seconds > 0 || throw(ArgumentError("max_time_seconds must be positive, got $(b.max_time_seconds)"))
+    b.beam_width > 0 || throw(ArgumentError("beam_width must be positive, got $(b.beam_width)"))
+    config.targeted_hotspot_sites >= 0 || throw(ArgumentError("targeted_hotspot_sites must be >= 0, got $(config.targeted_hotspot_sites)"))
+    config.post_simplify_max_nodes > 0 || throw(ArgumentError("post_simplify_max_nodes must be positive, got $(config.post_simplify_max_nodes)"))
+    config.post_simplify_timeout_secs > 0 || throw(ArgumentError("post_simplify_timeout_secs must be positive, got $(config.post_simplify_timeout_secs)"))
+    config.acceptance_improvement_min >= 0 || throw(ArgumentError("acceptance_improvement_min must be >= 0, got $(config.acceptance_improvement_min)"))
+    config.simplify_pass_nodes_growth >= 1.0 || throw(ArgumentError("simplify_pass_nodes_growth must be >= 1.0, got $(config.simplify_pass_nodes_growth)"))
+    b.beam_width <= b.max_nodes || throw(ArgumentError("beam_width ($(b.beam_width)) must be <= max_nodes ($(b.max_nodes))"))
+    return nothing
 end
