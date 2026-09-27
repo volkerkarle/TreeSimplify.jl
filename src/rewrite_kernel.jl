@@ -75,16 +75,14 @@ end
     rewrite_rule_registry()
 
 Return a NamedTuple `(safe = ..., aggressive = ...)` containing
-deterministic rewrite rules built on SymbolicUtils' `@rule` macro.
+deterministic rewrite rules built on SymbolicUtils `@rule` macro.
 
-**Safe rules** – always correct, no structural risk:
-    x + 0 → x          0 + x → x          x - 0 → x
-    x * 1 → x          1 * x → x          x * 0 → 0
-    0 * x → 0          x / 1 → x          x - x → 0
-    x + x → 2x
+Safe rules: add_zero_right, add_zero_left, sub_zero, mul_one_right,
+mul_one_left, pow_one, one_pow, mul_zero_right, mul_zero_left,
+div_one, sub_self, double_add, double_neg, common_denom_add,
+common_denom_sub.
 
-**Aggressive rules** – may change structure meaningfully:
-    x / x → 1          (via _self_division_rule)
+Aggressive rules: self_division, negate_sum.
 """
 function rewrite_rule_registry()
     safe_rules = (
@@ -93,15 +91,21 @@ function rewrite_rule_registry()
         RegisteredRule(:sub_zero,       :safe_identity, @rule(~x - 0 => ~x)),
         RegisteredRule(:mul_one_right,  :safe_identity, @rule(~x * 1 => ~x)),
         RegisteredRule(:mul_one_left,   :safe_identity, @rule(1 * ~x => ~x)),
+        RegisteredRule(:pow_one,        :safe_identity, @rule((~x)^1 => ~x)),
+        RegisteredRule(:one_pow,        :safe_identity, @rule(1^~x => 1)),
         RegisteredRule(:mul_zero_right, :safe_annihilator, @rule(~x * 0 => 0)),
         RegisteredRule(:mul_zero_left,  :safe_annihilator, @rule(0 * ~x => 0)),
         RegisteredRule(:div_one,        :safe_identity, @rule(~x / 1 => ~x)),
         RegisteredRule(:sub_self,       :safe_algebraic, @rule(~x - ~x => 0)),
         RegisteredRule(:double_add,     :safe_algebraic, @rule(~x + ~x => 2 * ~x)),
+        RegisteredRule(:double_neg,     :safe_algebraic, @rule(-(-~x) => ~x)),
+        RegisteredRule(:common_denom_add,  :safe_algebraic, @rule(~a / ~b + ~c / ~b => (~a + ~c) / ~b)),
+        RegisteredRule(:common_denom_sub,  :safe_algebraic, @rule(~a / ~b - ~c / ~b => (~a - ~c) / ~b)),
     )
 
     aggressive_rules = (
         RegisteredRule(:self_division, :aggressive_cancel, _self_division_rule),
+        RegisteredRule(:negate_sum,    :aggressive_cancel, @rule(-(~a + ~b) => -(~a) - (~b))),
     )
 
     return (safe = safe_rules, aggressive = aggressive_rules)
@@ -189,15 +193,37 @@ function _rewrite_postwalk(expr, f::Function)
 end
 
 """
-    _simplify_rational_node(node)
+    _count_divisions(expr; depth=0, max_depth=20)
+
+Count the number of division operators in an expression tree, bounded
+by `max_depth`.  Used to avoid expensive multivariate GCD in
+`simplify_fractions` when there are many unrelated divisions.
+"""
+function _count_divisions(expr; depth::Int = 0, max_depth::Int = 20)
+    depth > max_depth && return 0
+    !_term_is_call(expr) && return 0
+    total = _isop(/, expr) ? 1 : 0
+    for arg in SymbolicUtils.arguments(expr)
+        total += _count_divisions(arg; depth = depth + 1, max_depth = max_depth)
+    end
+    return total
+end
+
+"""
+    _simplify_rational_node(node; max_divisions=3)
 
 Apply `simplify_fractions` and `quick_cancel` in sequence to a single
-tree node.  Both are part of SymbolicUtils and are safe for BigInt
-rational arithmetic.
+tree node.  `simplify_fractions` is skipped when the subtree contains
+more than `max_divisions` division nodes, because its multivariate-GCD
+step scales exponentially with the number of independent fraction terms.
 """
-function _simplify_rational_node(node)
+function _simplify_rational_node(node; max_divisions::Int = 3)
     current = node
-    for op in (SymbolicUtils.simplify_fractions, SymbolicUtils.quick_cancel)
+    n_div = _count_divisions(current)
+    ops = n_div <= max_divisions ?
+        (SymbolicUtils.simplify_fractions, SymbolicUtils.quick_cancel) :
+        (SymbolicUtils.quick_cancel,)
+    for op in ops
         try
             updated = op(current)
             if updated !== nothing
@@ -344,13 +370,7 @@ function apply_post_simplify(expr; max_nodes::Int = 800, max_passes::Int = 4, ti
                 return nothing
             end
             _contains_division(node) || return nothing
-            candidate = try
-                SymbolicUtils.simplify_fractions(node)
-            catch e
-                e isa InterruptException && rethrow()
-                @debug "simplify_fractions failed in post_simplify" node = structural_hash(node) exception = e
-                nothing
-            end
+            candidate = _simplify_rational_node(node)
             if candidate === nothing || structural_hash(candidate) == structural_hash(node)
                 return nothing
             end
